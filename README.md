@@ -6,16 +6,11 @@
 
 ### GPU 环境配置（推荐）
 
-**注意**：TensorFlow 2.11+ 在原生 Windows 上不再支持 GPU，因此使用 **TensorFlow 2.10**（Windows 原生支持的最后一个 GPU 版本）。
-
 | TensorFlow 版本 | CUDA 版本 | cuDNN 版本 |
 |----------------|-----------|------------|
 | 2.10.0         | 11.2      | 8.1        |
 
-#### 方法1：使用 conda 安装（推荐）
-
-**注意**：TensorFlow 2.10 需要 Python 3.7-3.10，请确保不要安装太新的 Python 版本。
-
+#### 方法：使用 conda 安装
 ```bash
 # 创建新环境（指定 Python 3.9）
 conda create -n matting python=3.9
@@ -24,19 +19,9 @@ conda activate matting
 # 安装 CUDA 工具包和 cuDNN（自动处理版本兼容）
 conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1
 
-# 安装 TensorFlow
-pip install tensorflow==2.10.0
-
-# 安装其他依赖（去掉 tensorflow）
-pip install fastapi uvicorn python-multipart aiohttp Pillow opencv-python numpy modelscope pydantic
+# 安装所有依赖
+pip install -r requirements.txt
 ```
-
-#### 方法2：系统级 CUDA 安装
-
-如果你不想用 conda：
-1. 下载并安装 CUDA 11.2：https://developer.nvidia.com/cuda-11.2.0-download-archive
-2. 下载并安装 cuDNN 8.1：https://developer.nvidia.com/cudnn
-3. 将 CUDA 和 cuDNN 的 bin 目录添加到系统 PATH
 
 #### 验证 GPU
 

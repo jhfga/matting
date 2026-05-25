@@ -1,0 +1,15 @@
+tensorflow==2.10.0
+torch
+modelscope
+addict
+datasets
+simplejson
+sortedcontainers
+fastapi
+uvicorn
+python-multipart
+aiohttp
+Pillow
+opencv-python==4.8.1.78
+numpy==1.23.5
+pydantic
