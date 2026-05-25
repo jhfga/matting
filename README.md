@@ -50,18 +50,18 @@ python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU')
 
 ## 启动服务
 
-### 1. 安装依赖
+### 1. 下载模型
 
 ```bash
-pip install -r requirements.txt
+modelscope download --model iic/cv_unet_universal-matting --local_dir ./models/cv_unet_universal-matting
 ```
 
-### 2. 配置模型路径
+### 2. 模型路径说明
 
-修改 `main.py` 中的模型路径（第18行）：
+模型路径已预配置为 `./models/cv_unet_universal-matting`，与上一步下载目录一致。如需自定义路径，可通过环境变量设置：
 
-```python
-MODEL_PATH = r"C:\你的\模型\路径\cv_unet_universal-matting"
+```bash
+set MATTING_MODEL_PATH=你的模型路径
 ```
 
 ### 3. 启动服务

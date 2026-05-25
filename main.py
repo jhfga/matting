@@ -51,7 +51,7 @@ from batch_processor import DynamicBatcher, MattingTask
 # ============================================================================
 # 配置 - 高性能优化版
 # ============================================================================
-MODEL_PATH = os.getenv("MATTING_MODEL_PATH", os.path.join(APP_DIR, "cv_unet_universal-matting"))
+MODEL_PATH = os.getenv("MATTING_MODEL_PATH", os.path.join(APP_DIR, "models", "cv_unet_universal-matting"))
 # 优化：增大批处理大小，GPU可处理更多
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "16"))
 # 优化：等待时间 0.2s，平衡响应速度和批处理效率
