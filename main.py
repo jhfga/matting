@@ -58,6 +58,8 @@ MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "500"))
 PREPROCESS_WORKERS = int(os.getenv("PREPROCESS_WORKERS", "4"))
 # 后处理线程数（裁剪 + 编码 + 返回结果，与 GPU 并行）
 POSTPROCESS_WORKERS = int(os.getenv("POSTPROCESS_WORKERS", "4"))
+# 并行推理模型实例数（多个模型实例同时处理不同请求，提高吞吐量，注意显存占用）
+INFERENCE_WORKERS = int(os.getenv("INFERENCE_WORKERS", "3"))
 API_KEY = os.getenv("API_KEY")  # 可选的 API 密钥验证
 
 # GPU 内存优化设置
@@ -149,6 +151,7 @@ async def lifespan(app: FastAPI):
     print(f"   队列容量: {MAX_QUEUE_SIZE}")
     print(f"   预处理线程: {PREPROCESS_WORKERS}")
     print(f"   后处理线程: {POSTPROCESS_WORKERS}")
+    print(f"   推理并行数: {INFERENCE_WORKERS}")
     print("-" * 60)
     print("📡 服务访问地址:")
     print(f"   本机访问: http://127.0.0.1:8000")
@@ -161,6 +164,7 @@ async def lifespan(app: FastAPI):
         max_queue_size=MAX_QUEUE_SIZE,
         preprocess_workers=PREPROCESS_WORKERS,
         postprocess_workers=POSTPROCESS_WORKERS,
+        num_inference_workers=INFERENCE_WORKERS,
     )
     batcher.initialize()
     
@@ -492,7 +496,8 @@ async def get_stats():
         "config": {
             "max_queue_size": MAX_QUEUE_SIZE,
             "preprocess_workers": PREPROCESS_WORKERS,
-            "postprocess_workers": POSTPROCESS_WORKERS
+            "postprocess_workers": POSTPROCESS_WORKERS,
+            "inference_workers": INFERENCE_WORKERS
         }
     }
 
