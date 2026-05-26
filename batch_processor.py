@@ -49,13 +49,11 @@ class DynamicBatcher:
         max_queue_size: int = 500,
         preprocess_workers: int = 4,
         postprocess_workers: int = 4,
-        num_inference_workers: int = 1,
     ):
         self.model_path = model_path
         self.max_queue_size = max_queue_size
         self.preprocess_workers = preprocess_workers
         self.postprocess_workers = postprocess_workers
-        self.num_inference_workers = num_inference_workers
 
         # 任务队列（asyncio 端，API 层提交）
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
@@ -64,8 +62,8 @@ class DynamicBatcher:
 
         self._shutdown = False
 
-        # 模型列表（每个推理线程一个独立实例）
-        self._models: list = []
+        # 模型
+        self._model = None
 
         # 线程池
         self._preprocess_pool = ThreadPoolExecutor(
@@ -75,8 +73,10 @@ class DynamicBatcher:
             max_workers=postprocess_workers, thread_name_prefix="postprocess"
         )
 
-        # 专用 GPU 推理线程（多个）
-        self._inference_threads: list[threading.Thread] = []
+        # 专用 GPU 推理线程
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop, name="gpu-inference", daemon=True
+        )
 
         # 事件循环引用（用于线程安全的 future 回调）
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -93,19 +93,17 @@ class DynamicBatcher:
         """初始化模型（在事件循环线程中调用）"""
         self._loop = asyncio.get_running_loop()
 
-        print(f"[Batcher] 正在加载模型: {self.model_path} (x{self.num_inference_workers})")
-        for i in range(self.num_inference_workers):
-            model = pipeline(Tasks.universal_matting, model=self.model_path)
-            self._models.append(model)
-            print(f"[Batcher] 模型实例 {i + 1}/{self.num_inference_workers} 加载完成")
+        print(f"[Batcher] 正在加载模型: {self.model_path}")
+        self._model = pipeline(Tasks.universal_matting, model=self.model_path)
+        print("[Batcher] 模型加载完成")
 
-        # 预热模型（只预热第一个实例，共享权重时其余实例也已完成初始化）
+        # 预热模型
         print("[Batcher] 预热模型...")
         try:
             dummy_img = np.zeros((256, 256, 3), dtype=np.uint8)
             dummy_path = os.path.join(tempfile.gettempdir(), "warmup.bmp")
             cv2.imwrite(dummy_path, dummy_img)
-            self._models[0]([dummy_path])
+            self._model([dummy_path])
             os.remove(dummy_path)
             print("[Batcher] 模型预热完成")
         except Exception as e:
@@ -114,17 +112,9 @@ class DynamicBatcher:
         # 启动调度协程
         asyncio.create_task(self._dispatch_loop())
 
-        # 启动多个专用推理线程
-        for i in range(self.num_inference_workers):
-            t = threading.Thread(
-                target=self._inference_loop,
-                name=f"gpu-inference-{i}",
-                daemon=True,
-                kwargs={"model": self._models[i]},
-            )
-            t.start()
-            self._inference_threads.append(t)
-        print(f"[Batcher] 流水线启动完成 ({self.num_inference_workers} 个推理线程)")
+        # 启动专用推理线程
+        self._inference_thread.start()
+        print("[Batcher] 流水线启动完成")
 
     async def submit(self, task: MattingTask) -> bool:
         """提交任务到队列"""
@@ -174,7 +164,7 @@ class DynamicBatcher:
     # ========================================================================
     # GPU 推理线程：紧密循环，单张推理
     # ========================================================================
-    def _inference_loop(self, model):
+    def _inference_loop(self):
         """专用 GPU 推理线程：取任务 → 推理 → 提交后处理"""
         while not self._shutdown:
             try:
@@ -186,7 +176,7 @@ class DynamicBatcher:
 
             try:
                 # 单张推理
-                results = model([task.temp_path])
+                results = self._model([task.temp_path])
                 raw_result = results[0]
                 inference_time = time.time() - inference_start
 
@@ -281,9 +271,8 @@ class DynamicBatcher:
     def shutdown(self):
         """关闭处理器"""
         self._shutdown = True
-        # 等待所有推理线程结束
-        for t in self._inference_threads:
-            t.join(timeout=5.0)
+        # 等待推理线程结束
+        self._inference_thread.join(timeout=5.0)
         # 关闭线程池
         self._preprocess_pool.shutdown(wait=False)
         self._postprocess_pool.shutdown(wait=False)
