@@ -25,9 +25,10 @@ if os.path.exists(cuda_path):
     if cuda_path not in os.environ["PATH"]:
         os.environ["PATH"] = cuda_path + os.pathsep + os.environ["PATH"]
 else:
-    # 回退到原始 conda 环境路径（开发时使用）
-    _cuda_conda = r"C:\ProgramData\anaconda3\envs\matting\Library\bin"
-    if _cuda_conda not in os.environ["PATH"]:
+    # 回退到 conda 环境路径（开发时使用，通过 conda install cudatoolkit 安装）
+    _conda_prefix = os.path.dirname(sys.executable)
+    _cuda_conda = os.path.join(_conda_prefix, "Library", "bin")
+    if os.path.isdir(_cuda_conda) and _cuda_conda not in os.environ["PATH"]:
         os.environ["PATH"] = _cuda_conda + os.pathsep + os.environ["PATH"]
 import io
 import base64
