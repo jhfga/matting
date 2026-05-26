@@ -1,7 +1,7 @@
 """
 高性能抠图 API 服务
 - FastAPI + Uvicorn 提供高并发支持
-- 动态批处理优化吞吐量
+- 流水线架构：预处理 → GPU推理 → 后处理，CPU/GPU 重叠执行
 - 支持 base64 图片上传和 URL 图片
 """
 import os
@@ -49,17 +49,15 @@ from batch_processor import DynamicBatcher, MattingTask
 
 
 # ============================================================================
-# 配置 - 高性能优化版
+# 配置 - 流水线架构优化版
 # ============================================================================
 MODEL_PATH = os.getenv("MATTING_MODEL_PATH", os.path.join(APP_DIR, "models", "cv_unet_universal-matting"))
-# 优化：增大批处理大小，GPU可处理更多
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "16"))
-# 优化：等待时间 0.2s，平衡响应速度和批处理效率
-MAX_WAIT_TIME = float(os.getenv("MAX_WAIT_TIME", "0.2"))
-# 优化：增大队列，应对突发流量
-MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "200"))
-# 优化：增加工作线程，支持更多并发批次
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", "4"))
+# 队列容量，缓冲突发流量
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "500"))
+# 预处理线程数（解码图片 + 保存临时文件，与 GPU 并行）
+PREPROCESS_WORKERS = int(os.getenv("PREPROCESS_WORKERS", "4"))
+# 后处理线程数（裁剪 + 编码 + 返回结果，与 GPU 并行）
+POSTPROCESS_WORKERS = int(os.getenv("POSTPROCESS_WORKERS", "4"))
 API_KEY = os.getenv("API_KEY")  # 可选的 API 密钥验证
 
 # GPU 内存优化设置
@@ -148,10 +146,9 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
     print("🚀 启动抠图 API 服务")
     print(f"   模型路径: {MODEL_PATH}")
-    print(f"   最大批次: {MAX_BATCH_SIZE}")
-    print(f"   最大等待: {MAX_WAIT_TIME}s")
     print(f"   队列容量: {MAX_QUEUE_SIZE}")
-    print(f"   工作线程: {NUM_WORKERS}")
+    print(f"   预处理线程: {PREPROCESS_WORKERS}")
+    print(f"   后处理线程: {POSTPROCESS_WORKERS}")
     print("-" * 60)
     print("📡 服务访问地址:")
     print(f"   本机访问: http://127.0.0.1:8000")
@@ -161,10 +158,9 @@ async def lifespan(app: FastAPI):
     
     batcher = DynamicBatcher(
         model_path=MODEL_PATH,
-        max_batch_size=MAX_BATCH_SIZE,
-        max_wait_time=MAX_WAIT_TIME,
         max_queue_size=MAX_QUEUE_SIZE,
-        num_workers=NUM_WORKERS
+        preprocess_workers=PREPROCESS_WORKERS,
+        postprocess_workers=POSTPROCESS_WORKERS,
     )
     batcher.initialize()
     
@@ -180,8 +176,8 @@ async def lifespan(app: FastAPI):
 # ============================================================================
 app = FastAPI(
     title="智能抠图 API",
-    description="高性能批量抠图服务 - 支持动态批处理和并发处理",
-    version="2.0.0",
+    description="高性能抠图服务 - 流水线架构，CPU/GPU 重叠执行，最大化吞吐",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -250,7 +246,7 @@ async def root():
     """根路径 - 服务信息"""
     return {
         "service": "智能抠图 API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "docs": "/docs",
         "health": "/health"
     }
@@ -260,7 +256,7 @@ async def root():
 async def health_check():
     """健康检查端点"""
     stats = batcher.get_stats() if batcher else {}
-    queue_size = batcher._queue.qsize() if batcher else 0
+    queue_size = stats.get('queue_size', 0)
     
     return HealthResponse(
         status="healthy",
@@ -291,7 +287,7 @@ async def matting(request: MattingRequest):
     
     # 创建任务
     task_id = str(uuid.uuid4())[:8]
-    future = asyncio.get_event_loop().create_future()
+    future = asyncio.get_running_loop().create_future()
     
     task = MattingTask(
         task_id=task_id,
@@ -357,7 +353,7 @@ async def batch_matting(request: BatchMattingRequest):
         try:
             image_bytes = decode_base64_image(img_data)
             task_id = f"{i}_{uuid.uuid4().hex[:6]}"
-            future = asyncio.get_event_loop().create_future()
+            future = asyncio.get_running_loop().create_future()
             
             task = MattingTask(
                 task_id=task_id,
@@ -447,7 +443,7 @@ async def matting_upload(
     
     # 创建任务
     task_id = str(uuid.uuid4())[:8]
-    future = asyncio.get_event_loop().create_future()
+    future = asyncio.get_running_loop().create_future()
     
     task = MattingTask(
         task_id=task_id,
@@ -493,12 +489,10 @@ async def get_stats():
     stats = batcher.get_stats()
     return {
         "stats": stats,
-        "queue_size": batcher._queue.qsize(),
         "config": {
-            "max_batch_size": MAX_BATCH_SIZE,
-            "max_wait_time": MAX_WAIT_TIME,
             "max_queue_size": MAX_QUEUE_SIZE,
-            "num_workers": NUM_WORKERS
+            "preprocess_workers": PREPROCESS_WORKERS,
+            "postprocess_workers": POSTPROCESS_WORKERS
         }
     }
 

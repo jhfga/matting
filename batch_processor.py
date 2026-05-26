@@ -1,14 +1,17 @@
 """
-批量抠图处理器 - 支持动态批处理和并发控制
+抠图处理器 - 流水线架构
+预处理线程池 → 专用GPU推理线程 → 后处理线程池
+CPU 工作与 GPU 推理重叠执行，最大化 GPU 利用率
 """
 import asyncio
 import io
 import os
+import queue
 import tempfile
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Callable
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from PIL import Image
 import cv2
@@ -26,70 +29,93 @@ class MattingTask:
     image_format: str
     future: asyncio.Future
     created_at: float
-    trim_edges: bool = True  # 是否裁剪透明边缘
+    trim_edges: bool = True
+    # 流水线内部字段
+    temp_path: Optional[str] = None
+    loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 class DynamicBatcher:
     """
-    动态批处理器
-    - 收集多个请求并批量处理
-    - 支持超时机制和最大批次数限制
-    - 自动调整批次大小以优化吞吐量
+    流水线批处理器
+    - 预处理线程池：解码图片 + 保存临时文件（与 GPU 并行）
+    - 专用推理线程：单张推理，紧密循环（GPU 零间隙）
+    - 后处理线程池：裁剪 + 编码 + 返回结果（与 GPU 并行）
     """
-    
+
     def __init__(
         self,
         model_path: str,
-        max_batch_size: int = 8,
-        max_wait_time: float = 0.05,
-        max_queue_size: int = 100,
-        num_workers: int = 2
+        max_queue_size: int = 500,
+        preprocess_workers: int = 4,
+        postprocess_workers: int = 4,
     ):
         self.model_path = model_path
-        self.max_batch_size = max_batch_size
-        self.max_wait_time = max_wait_time
         self.max_queue_size = max_queue_size
-        
-        # 任务队列
-        self._queue = asyncio.Queue(maxsize=max_queue_size)
+        self.preprocess_workers = preprocess_workers
+        self.postprocess_workers = postprocess_workers
+
+        # 任务队列（asyncio 端，API 层提交）
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        # 预处理完成后的就绪队列（线程安全，推理线程消费）
+        self._ready_queue: queue.Queue = queue.Queue()
+
         self._shutdown = False
-        
-        # 模型和线程池
+
+        # 模型
         self._model = None
-        self._executor = ThreadPoolExecutor(max_workers=num_workers)
-        self._model_lock = threading.Lock()
-        
+
+        # 线程池
+        self._preprocess_pool = ThreadPoolExecutor(
+            max_workers=preprocess_workers, thread_name_prefix="preprocess"
+        )
+        self._postprocess_pool = ThreadPoolExecutor(
+            max_workers=postprocess_workers, thread_name_prefix="postprocess"
+        )
+
+        # 专用 GPU 推理线程
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop, name="gpu-inference", daemon=True
+        )
+
+        # 事件循环引用（用于线程安全的 future 回调）
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
         # 统计信息
         self._stats = {
             'total_processed': 0,
-            'total_batches': 0,
-            'avg_batch_size': 0.0,
-            'avg_processing_time': 0.0
+            'avg_inference_time': 0.0,
+            'avg_total_time': 0.0,
         }
         self._stats_lock = threading.Lock()
-        
+
     def initialize(self):
-        """初始化模型（在主线程中调用）"""
+        """初始化模型（在事件循环线程中调用）"""
+        self._loop = asyncio.get_running_loop()
+
         print(f"[Batcher] 正在加载模型: {self.model_path}")
         self._model = pipeline(Tasks.universal_matting, model=self.model_path)
         print("[Batcher] 模型加载完成")
-        
-        # 预热模型 - 执行一次推理让GPU准备好
+
+        # 预热模型
         print("[Batcher] 预热模型...")
         try:
-            import numpy as np
             dummy_img = np.zeros((256, 256, 3), dtype=np.uint8)
-            dummy_path = os.path.join(tempfile.gettempdir(), "warmup.png")
+            dummy_path = os.path.join(tempfile.gettempdir(), "warmup.bmp")
             cv2.imwrite(dummy_path, dummy_img)
             self._model([dummy_path])
             os.remove(dummy_path)
             print("[Batcher] 模型预热完成")
         except Exception as e:
             print(f"[Batcher] 预热警告: {e}")
-        
-        # 启动批处理循环
-        asyncio.create_task(self._batch_loop())
-        
+
+        # 启动调度协程
+        asyncio.create_task(self._dispatch_loop())
+
+        # 启动专用推理线程
+        self._inference_thread.start()
+        print("[Batcher] 流水线启动完成")
+
     async def submit(self, task: MattingTask) -> bool:
         """提交任务到队列"""
         try:
@@ -97,172 +123,156 @@ class DynamicBatcher:
             return True
         except asyncio.QueueFull:
             return False
-    
-    async def _batch_loop(self):
-        """批处理主循环 - 优化版：快速收集，立即处理"""
+
+    # ========================================================================
+    # 调度协程：从 asyncio 队列取任务，提交预处理
+    # ========================================================================
+    async def _dispatch_loop(self):
+        """调度循环：取任务 → 提交预处理线程池"""
         while not self._shutdown:
-            batch: List[MattingTask] = []
-            
-            # 优化：先快速收集，不等待，马上处理
-            # 这样可以让GPU保持忙碌状态
             try:
-                # 第一个任务等待超时
-                first_task = await asyncio.wait_for(
-                    self._queue.get(),
-                    timeout=self.max_wait_time
-                )
-                batch.append(first_task)
-                
-                # 然后快速收集队列中的其他任务（不等待新请求）
-                while len(batch) < self.max_batch_size:
-                    try:
-                        task = self._queue.get_nowait()
-                        batch.append(task)
-                    except asyncio.QueueEmpty:
-                        break
-                        
+                task = await asyncio.wait_for(self._queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
-                # 长时间没有任务，短暂休眠避免CPU空转
-                await asyncio.sleep(0.01)
                 continue
-            
-            if batch:
-                # 立即处理批次
-                asyncio.create_task(self._process_batch(batch))
-    
-    async def _process_batch(self, batch: List[MattingTask]):
-        """处理一批任务"""
-        start_time = time.time()
-        
+
+            # 记录事件循环引用，用于后处理时线程安全回调
+            task.loop = self._loop
+            # 提交到预处理线程池
+            self._preprocess_pool.submit(self._preprocess, task)
+
+    # ========================================================================
+    # 预处理：解码图片 + 保存临时 BMP 文件
+    # ========================================================================
+    def _preprocess(self, task: MattingTask):
+        """预处理：解码 bytes → 保存 BMP 临时文件 → 放入就绪队列"""
         try:
-            # 在线程池中执行模型推理
-            results = await asyncio.get_event_loop().run_in_executor(
-                self._executor,
-                self._inference_batch,
-                batch
+            img = Image.open(io.BytesIO(task.image_data)).convert('RGB')
+            # 使用 BMP 格式，无压缩，写入速度远快于 PNG
+            temp_path = os.path.join(
+                tempfile.gettempdir(),
+                f"matting_{task.task_id}_{int(time.time() * 1000)}.bmp"
             )
-            
-            # 设置每个任务的结果
-            for task, result in zip(batch, results):
-                if not task.future.done():
-                    task.future.set_result(result)
-                    
+            img.save(temp_path, format='BMP')
+            task.temp_path = temp_path
+            self._ready_queue.put(task)
         except Exception as e:
-            # 批次失败时，每个任务都设置异常
-            for task in batch:
-                if not task.future.done():
-                    task.future.set_exception(e)
-        
-        # 更新统计
-        processing_time = time.time() - start_time
-        with self._stats_lock:
-            self._stats['total_processed'] += len(batch)
-            self._stats['total_batches'] += 1
-            n = self._stats['total_batches']
-            self._stats['avg_batch_size'] = (
-                (self._stats['avg_batch_size'] * (n - 1) + len(batch)) / n
-            )
-            self._stats['avg_processing_time'] = (
-                (self._stats['avg_processing_time'] * (n - 1) + processing_time) / n
-            )
-        
-        print(f"[Batcher] 处理批次: {len(batch)} 张, 耗时: {processing_time:.3f}s")
-    
-    def _inference_batch(self, batch: List[MattingTask]) -> List[Dict[str, Any]]:
-        """
-        执行批量推理（使用 ModelScope 原生批量支持）
-        一次性把所有图片传给模型，让模型内部并行处理
-        """
-        results = [{} for _ in batch]  # 预初始化结果列表
-        temp_paths = []
-        
+            # 预处理失败，直接返回错误
+            result = {'success': False, 'error': f'预处理失败: {e}'}
+            if task.loop and not task.future.done():
+                task.loop.call_soon_threadsafe(task.future.set_result, result)
+
+    # ========================================================================
+    # GPU 推理线程：紧密循环，单张推理
+    # ========================================================================
+    def _inference_loop(self):
+        """专用 GPU 推理线程：取任务 → 推理 → 提交后处理"""
+        while not self._shutdown:
+            try:
+                task = self._ready_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            inference_start = time.time()
+
+            try:
+                # 单张推理
+                results = self._model([task.temp_path])
+                raw_result = results[0]
+                inference_time = time.time() - inference_start
+
+                # 提交后处理到线程池
+                self._postprocess_pool.submit(
+                    self._postprocess, task, raw_result, inference_time
+                )
+
+            except Exception as e:
+                inference_time = time.time() - inference_start
+                result = {'success': False, 'error': f'推理失败: {e}'}
+                if task.loop and not task.future.done():
+                    task.loop.call_soon_threadsafe(task.future.set_result, result)
+                self._update_stats(inference_time, 0)
+
+    # ========================================================================
+    # 后处理：裁剪 + 编码 + 删临时文件 + 返回结果
+    # ========================================================================
+    def _postprocess(self, task: MattingTask, raw_result: Dict, inference_time: float):
+        """后处理：裁剪透明边缘 + 编码 PNG + 删除临时文件"""
+        postprocess_start = time.time()
         try:
-            with self._model_lock:
-                # 第1步：并行保存所有图片到临时文件
-                for i, task in enumerate(batch):
-                    try:
-                        img = Image.open(io.BytesIO(task.image_data)).convert('RGB')
-                        temp_path = os.path.join(tempfile.gettempdir(), f"matting_{task.task_id}_{int(time.time()*1000)}.png")
-                        img.save(temp_path)  # 使用默认压缩，保证图片质量
-                        temp_paths.append(temp_path)
-                    except Exception as e:
-                        # 单张保存失败，记录错误并继续
-                        temp_paths.append(None)
-                        results[i] = {
-                            'success': False,
-                            'error': f'保存临时文件失败: {e}'
-                        }
-                
-                # 第2步：过滤掉保存失败的，提取有效路径
-                valid_paths = [p for p in temp_paths if p is not None]
-                
-                if valid_paths:
-                    # 第3步：一次性传给模型进行批量推理！
-                    # ModelScope pipeline 支持 list 输入，内部会并行处理
-                    batch_results = self._model(valid_paths)
-                    
-                    # 第4步：整理结果
-                    result_idx = 0
-                    for i, task in enumerate(batch):
-                        if temp_paths[i] is None:
-                            # 之前保存失败的，继续下一个（result_idx 保持不变）
-                            continue
-                            
-                        try:
-                            # 获取对应结果
-                            res = batch_results[result_idx]
-                            output_img = res[OutputKeys.OUTPUT_IMG]
-                            
-                            # 根据参数决定是否裁剪透明边缘
-                            if batch[i].trim_edges:
-                                output_img = self._trim_transparent(output_img)
-                            
-                            # 编码为 bytes - 使用默认 PNG 压缩，保证图片质量
-                            _, buffer = cv2.imencode('.png', output_img)
-                            output_bytes = buffer.tobytes()
-                            
-                            results[i] = {
-                                'success': True,
-                                'data': output_bytes,
-                                'format': 'png'
-                            }
-                            
-                        except Exception as e:
-                            results[i] = {
-                                'success': False,
-                                'error': f'处理失败: {e}'
-                            }
-                        result_idx += 1
-                
+            output_img = raw_result[OutputKeys.OUTPUT_IMG]
+
+            # 裁剪透明边缘
+            if task.trim_edges:
+                output_img = self._trim_transparent(output_img)
+
+            # 编码为 PNG bytes
+            _, buffer = cv2.imencode('.png', output_img)
+            output_bytes = buffer.tobytes()
+
+            result = {
+                'success': True,
+                'data': output_bytes,
+                'format': 'png'
+            }
+
+        except Exception as e:
+            result = {'success': False, 'error': f'后处理失败: {e}'}
+
         finally:
-            # 清理所有临时文件 - 异步删除减少阻塞
-            for temp_path in temp_paths:
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except:
-                        pass
-        
-        return results
-    
+            # 删除临时文件
+            if task.temp_path:
+                try:
+                    os.remove(task.temp_path)
+                except OSError:
+                    pass
+
+        # 线程安全地设置 future 结果
+        if task.loop and not task.future.done():
+            task.loop.call_soon_threadsafe(task.future.set_result, result)
+
+        # 更新统计
+        postprocess_time = time.time() - postprocess_start
+        self._update_stats(inference_time, postprocess_time)
+
+    # ========================================================================
+    # 工具方法
+    # ========================================================================
     def _trim_transparent(self, img_array: np.ndarray) -> np.ndarray:
         """裁剪透明边缘"""
-        # 转换为 PIL Image 处理透明边缘
         if len(img_array.shape) == 3 and img_array.shape[2] == 4:
-            # 已有 Alpha 通道
             pil_img = Image.fromarray(cv2.cvtColor(img_array, cv2.COLOR_BGRA2RGBA))
             bbox = pil_img.getbbox()
             if bbox:
                 pil_img = pil_img.crop(bbox)
                 return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGBA2BGRA)
         return img_array
-    
+
+    def _update_stats(self, inference_time: float, postprocess_time: float):
+        """更新统计信息"""
+        with self._stats_lock:
+            n = self._stats['total_processed'] + 1
+            self._stats['total_processed'] = n
+            self._stats['avg_inference_time'] = (
+                (self._stats['avg_inference_time'] * (n - 1) + inference_time) / n
+            )
+            total_time = inference_time + postprocess_time
+            self._stats['avg_total_time'] = (
+                (self._stats['avg_total_time'] * (n - 1) + total_time) / n
+            )
+
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
         with self._stats_lock:
-            return self._stats.copy()
-    
+            stats = self._stats.copy()
+        stats['queue_size'] = self._queue.qsize()
+        stats['ready_queue_size'] = self._ready_queue.qsize()
+        return stats
+
     def shutdown(self):
         """关闭处理器"""
         self._shutdown = True
-        self._executor.shutdown(wait=True)
+        # 等待推理线程结束
+        self._inference_thread.join(timeout=5.0)
+        # 关闭线程池
+        self._preprocess_pool.shutdown(wait=False)
+        self._postprocess_pool.shutdown(wait=False)
