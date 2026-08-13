@@ -29,10 +29,6 @@ pip install -r requirements.txt
 python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
-### CPU-only 环境
-
-如果没有 GPU，可以修改 `requirements.txt`，将 `tensorflow==2.10.0` 替换为 `tensorflow-cpu==2.10.0`
-
 ## 启动服务
 
 ### 1. 下载模型
